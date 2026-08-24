@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+triage.db
+.pytest_cache/
+setup.log
