@@ -46,7 +46,7 @@ async def list_transactions(account_id: str, days: int = 30, limit: int = 50) ->
     """
     return await _get(
         f"/accounts/{account_id}/transactions",
-        {"days": 3650, "limit": 500},
+        {"days": days, "limit": limit},
     )
 
 
