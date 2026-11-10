@@ -48,8 +48,8 @@ CREATE TABLE cases (
 
 CREATE TABLE decisions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    case_id    TEXT NOT NULL,
-    decision   TEXT NOT NULL,               -- approve | block | needs_review
+    case_id    TEXT NOT NULL UNIQUE REFERENCES cases(id),  -- one decision per case
+    decision   TEXT NOT NULL CHECK (decision IN ('approve', 'block', 'needs_review')),
     rationale  TEXT NOT NULL,
     created_at TEXT NOT NULL
 );

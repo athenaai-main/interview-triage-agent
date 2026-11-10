@@ -6,9 +6,12 @@ the ops console and the batch reconciliation jobs (not in this repo).
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import db
@@ -25,7 +28,8 @@ def _now() -> str:
 
 class DecisionIn(BaseModel):
     case_id: str = Field(..., description="Case being decided")
-    decision: str = Field(..., description="approve | block | needs_review")
+    decision: Literal["approve", "block", "needs_review"] = Field(
+        ..., description="approve | block | needs_review")
     rationale: str = Field(..., description="Evidence-backed explanation")
 
 
@@ -115,41 +119,80 @@ def get_merchant(merchant_id: str):
 
 @app.post("/decisions", status_code=201)
 def record_decision(body: DecisionIn):
+    """Record the one decision a case gets, and its audit entry, atomically.
+
+    - Unknown case -> 404. Nothing is written.
+    - Case already decided with the same outcome -> 200 with the existing
+      decision. A client retrying after a lost response gets this, so the
+      retry does not write a second decision.
+    - Case already decided with a different outcome (for example, an analyst
+      already closed it) -> 409. The existing decision stays as it is.
+    """
     conn = db.connect()
     try:
-        cur = conn.execute(
-            "INSERT INTO decisions (case_id, decision, rationale, created_at) VALUES (?,?,?,?)",
-            (body.case_id, body.decision, body.rationale, _now()),
+        # Take the write lock before reading, so two concurrent requests for
+        # one case cannot both pass the "not yet decided" check.
+        conn.execute("BEGIN IMMEDIATE")
+        case = conn.execute(
+            "SELECT status, outcome FROM cases WHERE id = ?", (body.case_id,)
+        ).fetchone()
+        if case is None:
+            raise HTTPException(404, f"case {body.case_id} not found")
+
+        existing = conn.execute(
+            "SELECT id, decision FROM decisions WHERE case_id = ? ORDER BY id LIMIT 1",
+            (body.case_id,),
+        ).fetchone()
+        if existing is not None or case["status"] != "flagged":
+            prior = existing["decision"] if existing is not None else case["outcome"]
+            if existing is not None and prior == body.decision:
+                return JSONResponse(status_code=200, content={
+                    "decision_id": existing["id"], "case_id": body.case_id,
+                    "decision": prior, "already_recorded": True,
+                })
+            raise HTTPException(
+                409, f"case {body.case_id} is already closed with outcome {prior!r}")
+
+        try:
+            cur = conn.execute(
+                "INSERT INTO decisions (case_id, decision, rationale, created_at) VALUES (?,?,?,?)",
+                (body.case_id, body.decision, body.rationale, _now()),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, f"case {body.case_id} already has a decision")
+        conn.execute(
+            "UPDATE cases SET status = 'closed', outcome = ? WHERE id = ? AND status = 'flagged'",
+            (body.decision, body.case_id),
         )
-        conn.execute("UPDATE cases SET status = 'closed', outcome = ? WHERE id = ?",
-                     (body.decision, body.case_id))
+        # Same transaction as the decision, so the two cannot get out of step.
+        write_audit(conn, actor="agent:triage", action="decision.recorded",
+                    case_id=body.case_id, detail=body.decision)
         conn.commit()
         decision_id = cur.lastrowid
         written = conn.execute(
             "SELECT COUNT(*) FROM decisions WHERE case_id = ?", (body.case_id,)
         ).fetchone()[0]
     finally:
+        conn.rollback()  # no-op after commit; releases the lock on error paths
         conn.close()
 
+    # Simulated INFRA-2291 fault: the write commits but the response is lost.
+    # Because the commit above already includes the audit entry, the ledger
+    # stays consistent and the client's retry is handled as a replay.
     if body.case_id in DEGRADED_SHARD and written == 1:
         raise HTTPException(503, "upstream timeout")
 
-    write_audit(actor="agent:triage", action="decision.recorded",
-                case_id=body.case_id, detail=body.decision)
     return {"decision_id": decision_id, "case_id": body.case_id, "decision": body.decision}
 
 
-
-def write_audit(*, actor: str, action: str, case_id: str | None, detail: str) -> None:
-    conn = db.connect()
-    try:
-        conn.execute(
-            "INSERT INTO audit_log (ts, actor, action, case_id, detail) VALUES (?,?,?,?,?)",
-            (_now(), actor, action, case_id, detail),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+def write_audit(conn: sqlite3.Connection, *, actor: str, action: str,
+                case_id: str | None, detail: str) -> None:
+    """Append an audit entry on the caller's connection. The caller commits,
+    so the entry is written together with the change it records."""
+    conn.execute(
+        "INSERT INTO audit_log (ts, actor, action, case_id, detail) VALUES (?,?,?,?,?)",
+        (_now(), actor, action, case_id, detail),
+    )
 
 
 @app.get("/decisions/{case_id}")
